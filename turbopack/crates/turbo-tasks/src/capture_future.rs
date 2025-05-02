@@ -1,13 +1,18 @@
 use std::{
     cell::RefCell,
+    fmt::Display,
     future::Future,
+    panic,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
+use anyhow::Result;
 use pin_project_lite::pin_project;
 use turbo_tasks_malloc::{AllocationInfo, TurboMalloc};
+
+use crate::LAST_ERROR_LOCATION;
 
 struct ThreadLocalData {
     duration: Duration,
@@ -64,8 +69,27 @@ pub fn add_allocation_info(alloc_info: AllocationInfo) {
     });
 }
 
+#[derive(Debug, Clone)]
+pub struct TurboTasksPanic {
+    pub message: Option<&'static str>,
+    pub location: Option<String>,
+}
+
+impl Display for TurboTasksPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TurboTasksPanic: ")
+        // if let Some(location) = &self.location {
+        //     write!(f, "{} at {}", self.message, location)
+        // } else {
+        //     write!(f, "{}", self.message)
+        // }
+    }
+}
+
+impl std::error::Error for TurboTasksPanic {}
+
 impl<T, F: Future<Output = T>> Future for CaptureFuture<T, F> {
-    type Output = (T, Duration, usize);
+    type Output = (Result<T, TurboTasksPanic>, Duration, usize);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -80,7 +104,16 @@ impl<T, F: Future<Output = T>> Future for CaptureFuture<T, F> {
         EXTRA.with_borrow_mut(|cell| {
             *cell = Some(&mut data as *mut ThreadLocalData);
         });
-        let result = this.future.poll(cx);
+
+        let result =
+            panic::catch_unwind(panic::AssertUnwindSafe(|| this.future.poll(cx))).map_err(|err| {
+                let message = err.downcast_ref::<&'static str>().copied();
+                LAST_ERROR_LOCATION.with_borrow(|loc| TurboTasksPanic {
+                    message,
+                    location: loc.clone(),
+                })
+            });
+
         drop(guard);
         let elapsed = start.elapsed();
         let allocations = start_allocations.until_now();
@@ -88,11 +121,15 @@ impl<T, F: Future<Output = T>> Future for CaptureFuture<T, F> {
         *this.allocations += allocations.allocations + data.allocations;
         *this.deallocations += allocations.deallocations + data.deallocations;
         match result {
-            Poll::Ready(r) => {
+            Err(err) => {
                 let memory_usage = this.allocations.saturating_sub(*this.deallocations);
-                Poll::Ready((r, *this.duration, memory_usage))
+                Poll::Ready((Err(err), *this.duration, memory_usage))
             }
-            Poll::Pending => Poll::Pending,
+            Ok(Poll::Ready(r)) => {
+                let memory_usage = this.allocations.saturating_sub(*this.deallocations);
+                Poll::Ready((Ok(r), *this.duration, memory_usage))
+            }
+            Ok(Poll::Pending) => Poll::Pending,
         }
     }
 }

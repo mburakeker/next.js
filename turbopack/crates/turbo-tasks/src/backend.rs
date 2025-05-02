@@ -4,6 +4,7 @@ use std::{
     future::Future,
     hash::{BuildHasherDefault, Hash},
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -23,7 +24,7 @@ use crate::{
     task_statistics::TaskStatisticsApi,
     triomphe_utils::unchecked_sidecast_triomphe_arc,
     FunctionId, RawVc, ReadCellOptions, ReadRef, SharedReference, TaskId, TaskIdSet, TraitRef,
-    TraitTypeId, ValueTypeId, VcRead, VcValueTrait, VcValueType,
+    TraitTypeId, TurboTasksPanic, ValueTypeId, VcRead, VcValueTrait, VcValueType,
 };
 
 pub type TransientTaskRoot =
@@ -398,6 +399,45 @@ impl TryFrom<CellContent> for SharedReference {
 
 pub type TaskCollectiblesMap = AutoMap<RawVc, i32, BuildHasherDefault<FxHasher>, 1>;
 
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum TurboTasksExecutionError {
+    #[error("Task execution panicked")]
+    Panic(Arc<TurboTasksPanic>),
+    #[error("Task execution errored")]
+    Error {
+        message: Option<Cow<'static, str>>,
+        source: Option<Arc<TurboTasksExecutionError>>,
+    },
+}
+
+impl From<anyhow::Error> for TurboTasksExecutionError {
+    fn from(err: anyhow::Error) -> Self {
+        let mut current: &dyn std::error::Error = err.as_ref();
+        let mut found = None;
+        while let Some(current_source) = current.source() {
+            if let Some(err) = current_source.downcast_ref::<Arc<TurboTasksExecutionError>>() {
+                found = Some(err);
+                break;
+            }
+            current = current_source;
+        }
+
+        let found = found.cloned();
+        let message = match err.downcast::<String>() {
+            Ok(owned) => Some(Cow::Owned(owned)),
+            Err(any) => match any.downcast::<&'static str>() {
+                Ok(str) => Some(Cow::Borrowed(str)),
+                Err(_) => None,
+            },
+        };
+
+        TurboTasksExecutionError::Error {
+            message,
+            source: found,
+        }
+    }
+}
+
 pub trait Backend: Sync + Send {
     #[allow(unused_variables)]
     fn startup(&self, turbo_tasks: &dyn TurboTasksBackendApi<Self>) {}
@@ -459,8 +499,8 @@ pub trait Backend: Sync + Send {
 
     fn task_execution_result(
         &self,
-        task: TaskId,
-        result: Result<Result<RawVc>, Option<Cow<'static, str>>>,
+        task_id: TaskId,
+        result: Result<RawVc, Arc<TurboTasksExecutionError>>,
         turbo_tasks: &dyn TurboTasksBackendApi<Self>,
     );
 

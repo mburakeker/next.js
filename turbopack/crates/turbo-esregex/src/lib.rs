@@ -3,7 +3,6 @@
 use anyhow::{bail, Result};
 
 pub fn register() {
-    turbo_tasks::register();
     include!(concat!(env!("OUT_DIR"), "/register.rs"));
 }
 
