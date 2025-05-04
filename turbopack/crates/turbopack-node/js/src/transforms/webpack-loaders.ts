@@ -15,7 +15,7 @@ import {
   StackFrame,
   parse as parseStackTrace,
 } from '../compiled/stacktrace-parser'
-import { structuredError, type StructuredError } from 'src/ipc'
+import { structuredError, type StructuredError } from '../ipc'
 
 export type IpcInfoMessage =
   | {
